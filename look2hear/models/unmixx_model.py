@@ -693,6 +693,7 @@ class UNMIXX(BaseModel):
                                           )
                             )
         self.compress_factor = 0.3
+        self.register_buffer('_hann_window', torch.hann_window(self.win))
     def pad_input(self, input, window, stride):
         """
         Zero-padding input according to window/stride size.
@@ -710,12 +711,12 @@ class UNMIXX(BaseModel):
         return input, rest
     def do_stft(self,input):
         spec = torch.stft(input, n_fft=self.win, hop_length=self.stride, 
-                          window=torch.hann_window(self.win).to(input.device).type(input.type()),
+                          window=self._hann_window.to(dtype=input.dtype),
                           return_complex=True) #(batch,321,401)
         return spec
     def do_istft(self, spec, nsample):
         output = torch.istft(spec, n_fft=self.win, hop_length=self.stride,
-                             window=torch.hann_window(self.win).to(spec.device).type(spec.type()), length=nsample)
+                             window=self._hann_window.to(dtype=spec.real.dtype), length=nsample)
         return output
     def get_mag_pha_from_stft(self, stft_spec):
         stft_spec = torch.view_as_real(stft_spec)
@@ -725,7 +726,7 @@ class UNMIXX(BaseModel):
         return mag, pha
     def mag_pha_stft(self,input):
         stft_spec = torch.stft(input, n_fft=self.win, hop_length=self.stride, 
-                          window=torch.hann_window(self.win).to(input.device).type(input.type()),
+                          window=self._hann_window.to(dtype=input.dtype),
                           return_complex=True) #(batch,321,401)
         stft_spec = torch.view_as_real(stft_spec)
         mag = torch.sqrt(stft_spec.pow(2).sum(-1)+(1e-9))
@@ -752,7 +753,7 @@ class UNMIXX(BaseModel):
         batch_size, nch, nsample = input.shape
         input = input.view(batch_size*nch, -1) #원래가 nfft 2048, hop=512이고, n_filter 512, n_kernel 512였네..
         spec = torch.stft(input, n_fft=self.win, hop_length=self.stride, 
-                          window=torch.hann_window(self.win).to(input.device).type(input.type()),
+                          window=self._hann_window.to(dtype=input.dtype),
                           return_complex=True) #(batch,321,401)
         
         spec_RI = torch.stack([spec.real, spec.imag], 1)  # B*nch, 2, F, T
@@ -792,7 +793,7 @@ class UNMIXX(BaseModel):
         
         output = torch.istft(sep_subband_spec.view(batch_size*nch*self.num_output, self.enc_dim, -1), 
                              n_fft=self.win, hop_length=self.stride,
-                             window=torch.hann_window(self.win).to(input.device).type(input.type()), length=nsample)
+                             window=self._hann_window.to(dtype=input.dtype), length=nsample)
         b  = output.view(batch_size*nch, self.num_output, -1)
         reconstructed = pad_x_to_y(output, input)
         reconstructed = reconstructed + 1 / reconstructed.shape[1] * (
