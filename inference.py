@@ -222,42 +222,42 @@ def ensure_2d_channels_first(x: torch.Tensor):
         x = x.unsqueeze(0)
     return x
 
-def _align_to_previous(
-    prev: torch.Tensor,
-    cur: torch.Tensor,
-    compare_samples: int = 24000,
-    min_confidence: float = 0.01,
-) -> torch.Tensor:
+def _best_perm(ref: torch.Tensor, cand: torch.Tensor, min_confidence: float = 0.01) -> list:
     """
-    Ensure speaker ordering in `cur` is consistent with `prev` by comparing
-    the tail of `prev` against the head of `cur` for every permutation.
-    Returns `cur` with speakers reordered if needed.
-
-    prev, cur         : [S, T]  on CPU
-    compare_samples   : how many boundary samples to compare (default: 24000 = 1s at 24kHz)
-    min_confidence    : minimum difference in similarity scores to commit to a flip.
-                        If both orderings look equally bad (e.g. silence at boundary)
-                        we keep the current ordering rather than flipping randomly.
+    Find the permutation of speakers in `cand` [S, T] that best matches `ref` [S, T].
+    Uses cosine similarity in the spectral magnitude domain — more robust than
+    raw waveform comparison because it's invariant to phase differences.
+    Returns the best permutation as a list of indices, or identity if not confident.
     """
-    n = min(compare_samples, prev.shape[-1], cur.shape[-1])
-    ref = prev[:, -n:]   # [S, n]
-    cand = cur[:, :n]    # [S, n]
-    S = prev.shape[0]
-
     from itertools import permutations
+
+    S = ref.shape[0]
+    identity = tuple(range(S))
+
+    # Spectral magnitude: more stable than raw waveform cosine similarity
+    # because phase can differ even for the same speaker across chunks.
+    def spec_mag(x):
+        # x: [T] → magnitude spectrum averaged over time  [F]
+        w = torch.hann_window(512, device=x.device)
+        s = torch.stft(x, n_fft=512, hop_length=128, window=w, return_complex=True)
+        return s.abs().mean(dim=-1)  # [F]
+
+    ref_specs  = [spec_mag(ref[i])  for i in range(S)]
+    cand_specs = [spec_mag(cand[i]) for i in range(S)]
+
     scores = {}
     for perm in permutations(range(S)):
         scores[perm] = sum(
-            torch.nn.functional.cosine_similarity(ref[i].unsqueeze(0), cand[perm[i]].unsqueeze(0)).item()
+            torch.nn.functional.cosine_similarity(
+                ref_specs[i].unsqueeze(0), cand_specs[perm[i]].unsqueeze(0)
+            ).item()
             for i in range(S)
         ) / S
 
     best_perm = max(scores, key=scores.__getitem__)
-    identity  = tuple(range(S))
-    # Only reorder if the best permutation is meaningfully better than identity
     if best_perm != identity and (scores[best_perm] - scores[identity]) < min_confidence:
-        return cur  # not confident enough — keep current ordering
-    return cur[list(best_perm)]
+        return list(identity)  # not confident enough — keep current ordering
+    return list(best_perm)
 
 
 def _fmt_time(seconds: float) -> str:
@@ -311,14 +311,20 @@ def run_chunked(model, audio_input, chunk_samples, overlap_samples, sr: int):
         # Strip the context padding to get only [start, end)
         trim_start = start - ctx_start
         trim_end   = trim_start + (end - start)
-        ests = ests[:, trim_start:trim_end]
+        left_ctx   = ests[:, :trim_start]        # [S, overlap] — same audio as tail of prev chunk
+        ests       = ests[:, trim_start:trim_end]
 
-        # Align speaker ordering to the previous chunk to prevent identity flips.
-        # Use the full overlap window as the comparison region — much more
-        # reliable than a short boundary snippet, especially when there is
-        # silence or a rapid speech transition right at the boundary.
-        if output_chunks:
-            ests = _align_to_previous(output_chunks[-1], ests, compare_samples=overlap_samples)
+        # Align speaker ordering using the overlap region.
+        #
+        # The left context (left_ctx) covers [ctx_start, start) — the exact same
+        # audio segment that ends the previous chunk's output.  Both chunks
+        # processed that region, possibly assigning speakers in different order.
+        # Comparing them in the spectral domain gives a much stronger alignment
+        # signal than comparing adjacent (but different) audio at boundaries.
+        if output_chunks and left_ctx.shape[-1] > 0:
+            prev_tail = output_chunks[-1][:, -left_ctx.shape[-1]:]
+            perm = _best_perm(prev_tail, left_ctx)
+            ests = ests[perm]
 
         output_chunks.append(ests)
         chunk_idx += 1
