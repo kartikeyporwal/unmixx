@@ -7,6 +7,7 @@ import yaml
 from pathlib import Path
 from pprint import pprint
 
+import math
 import numpy as np
 import torch
 import torchaudio
@@ -259,7 +260,13 @@ def _align_to_previous(
     return cur[list(best_perm)]
 
 
-def run_chunked(model, audio_input, chunk_samples, overlap_samples):
+def _fmt_time(seconds: float) -> str:
+    seconds = int(seconds)
+    m, s = divmod(seconds, 60)
+    return f"{m}m {s:02d}s" if m else f"{s}s"
+
+
+def run_chunked(model, audio_input, chunk_samples, overlap_samples, sr: int):
     """
     Process long audio in chunks to fit in GPU memory.
     Each chunk is fed with extra context on both sides; the context is stripped
@@ -270,15 +277,22 @@ def run_chunked(model, audio_input, chunk_samples, overlap_samples):
     chunks.
 
     audio_input : [1, C, T]  (already on device)
+    sr          : sample rate (used for progress display)
     Returns     : [num_speakers, T]  (on CPU)
     """
+    import time
+
     _, _, T = audio_input.shape
+    total_chunks = math.ceil(T / chunk_samples)
+    total_audio_s = T / sr
     output_chunks = []
 
+    t_run_start = time.monotonic()
     start = 0
     chunk_idx = 0
     while start < T:
         end = min(start + chunk_samples, T)
+        t_chunk_start = time.monotonic()
 
         # Extend with context on both sides where available
         ctx_start = max(0, start - overlap_samples)
@@ -308,7 +322,21 @@ def run_chunked(model, audio_input, chunk_samples, overlap_samples):
 
         output_chunks.append(ests)
         chunk_idx += 1
-        print(f"  chunk {chunk_idx}: samples [{start}, {end}) / {T}")
+
+        # Progress + ETA
+        elapsed      = time.monotonic() - t_run_start
+        chunk_time   = time.monotonic() - t_chunk_start
+        done_frac    = chunk_idx / total_chunks
+        eta          = (elapsed / done_frac) * (1 - done_frac) if done_frac > 0 else 0
+        audio_done_s = end / sr
+        bar_len      = 30
+        filled       = int(bar_len * done_frac)
+        bar          = "█" * filled + "░" * (bar_len - filled)
+        print(
+            f"  [{bar}] {chunk_idx}/{total_chunks}  "
+            f"{audio_done_s:.1f}s / {total_audio_s:.1f}s  "
+            f"chunk {chunk_time:.1f}s  elapsed {_fmt_time(elapsed)}  ETA {_fmt_time(eta)}"
+        )
 
         start = end
 
@@ -396,7 +424,7 @@ def main():
         ests_speech = ests_speech[0].cpu()  # [S, T]
     else:
         print(f"[Inference] chunked — chunk={args.chunk_len}s, overlap={args.overlap}s")
-        ests_speech = run_chunked(model, audio_input, chunk_samples, overlap_samples)
+        ests_speech = run_chunked(model, audio_input, chunk_samples, overlap_samples, sr=target_sr)
 
     # Undo the LUFS gain so output loudness matches the original input
     ests_speech = ests_speech / lufs_gain
