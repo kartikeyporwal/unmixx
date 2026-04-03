@@ -7,6 +7,8 @@
 
 ## Quickstart
 
+Strictly require Python 3.9
+
 ### 1) Data Preprocessing
 We use a total of **400 hours** of singing datasets for training.  
 Download the datasets and follow the preprocessing steps in [MedleyVox preprocessing steps](https://github.com/jeonchangbin49/MedleyVox/tree/main/svs/preprocess).
@@ -74,7 +76,7 @@ Outputs will be saved to `separated_audio/`.
 - **`torch.load` FutureWarning suppressed** — `weights_only=False` set explicitly.
 
 ### Long-audio / chunked inference
-- **Speaker identity alignment via overlap region** — chunks share a 1-second overlap that both process independently. Alignment compares this identical audio in the **spectral magnitude domain** (phase-invariant) rather than raw waveforms at the boundary, preventing speaker identity flips for 10+ minute files.
+- **Global speaker alignment** — after all chunks are separated, each chunk's speaker ordering is aligned against the cumulative running-mean spectral embedding of all previously confirmed chunks (cosine similarity on average log-magnitude STFT, phase-invariant). A single misaligned chunk shifts the mean by only 1/(n+1), so later chunks self-correct instead of cascading. Replaces the old pairwise overlap-region comparison which could cascade after one flip.
 - **Silence gating** — streams more than `--silence_gate_db` dB below the mixture are zeroed out, preventing noise fill when one speaker is absent.
 - **Progress bar + ETA** — chunked inference prints a live progress bar with per-chunk timing and estimated time remaining.
 
