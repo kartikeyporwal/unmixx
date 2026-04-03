@@ -110,6 +110,27 @@ def normalize_outputs(ests):
     # 텐서인 경우
     return ests, ests
 
+def gate_silent_streams(ests: torch.Tensor, threshold_db: float = -40.0) -> torch.Tensor:
+    """
+    Zero out any separated stream whose energy is more than `threshold_db` dB
+    below the total mixture energy. This prevents the model from filling a
+    genuinely silent speaker slot with noise or bleed.
+
+    ests           : [S, T]
+    threshold_db   : streams below this relative level are zeroed (default -40 dB)
+    Returns        : [S, T]
+    """
+    mix_power = ests.pow(2).mean().clamp(min=1e-10)
+    out = ests.clone()
+    for i in range(ests.shape[0]):
+        stream_power = ests[i].pow(2).mean().clamp(min=1e-10)
+        rel_db = 10.0 * torch.log10(stream_power / mix_power)
+        if rel_db.item() < threshold_db:
+            print(f"  [Gate] stream {i+1} is {rel_db.item():.1f} dB below mixture — zeroed out")
+            out[i] = 0.0
+    return out
+
+
 def ensure_2d_channels_first(x: torch.Tensor):
     """
     [T] -> [1, T], [C, T]는 그대로
@@ -215,6 +236,9 @@ def main():
                              "Reduce if you still OOM.")
     parser.add_argument("--overlap", type=float, default=1.0,
                         help="Context overlap in seconds on each side of a chunk (default: 1).")
+    parser.add_argument("--silence_gate_db", type=float, default=-40.0,
+                        help="Streams whose energy is more than this many dB below the mixture "
+                             "are zeroed out (default: -40). Set to -inf to disable.")
     args = parser.parse_args()
 
     # Device
@@ -263,6 +287,7 @@ def main():
         ests_speech = run_chunked(model, audio_input, chunk_samples, overlap_samples)
 
     ests_speech_original = ests_speech  # same for save purposes
+    ests_speech = gate_silent_streams(ests_speech, threshold_db=args.silence_gate_db)
     num_speakers = ests_speech.shape[0]
     print(f"[Separation] detected {num_speakers} streams")
 
