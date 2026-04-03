@@ -291,17 +291,21 @@ def _stream_embedding(waveform: torch.Tensor, win: int = 960, stride: int = 240)
 
 def _global_align(chunks: list, win: int = 960, stride: int = 240) -> list:
     """
-    Globally align speaker ordering across all chunks using a running-mean
-    spectral embedding.
+    Globally align speaker ordering across all chunks.
 
-    Each chunk is compared against the cumulative average embedding of all
-    previously confirmed chunks (not just its immediate neighbour).
-    A single bad alignment cannot cascade: later chunks still compare against
-    the growing majority of correctly-aligned chunks and self-correct.
+    Strategy — anchor-based (cascade-free):
+      1. Compute a log-magnitude spectral embedding [F] for each stream in
+         every chunk.
+      2. Find the "anchor" chunk whose two streams are most spectrally distinct
+         (highest 1 − cosine_similarity between stream embeddings).  The anchor
+         has the clearest separation, so its stream-to-speaker assignment is the
+         most reliable reference.
+      3. Align EVERY other chunk directly to this anchor using cosine similarity.
+         Because all comparisons are against the same fixed reference, there is
+         no cascade: a wrong alignment in chunk i cannot influence chunk i+1.
 
-    RAM overhead: num_chunks × S × (win//2+1) floats.
-      2h audio, 30s chunks → 240 × 2 × 481 × 4B ≈ 0.9 MB.
-    The chunks themselves are already held in RAM before torch.cat.
+    RAM: num_chunks × S × (win//2+1) floats.
+      2h @ 30s chunks → 240 × 2 × 481 × 4B ≈ 0.9 MB.
 
     chunks : list of [S, T] CPU tensors
     Returns: list of [S, T] CPU tensors with consistent speaker ordering
@@ -314,39 +318,47 @@ def _global_align(chunks: list, win: int = 960, stride: int = 240) -> list:
 
     S = chunks[0].shape[0]
 
-    # Pre-compute per-stream embeddings for every chunk
+    # Pre-compute per-stream embeddings for every chunk  [N, S, F]
     all_embs = [
         [_stream_embedding(chunk[s], win, stride) for s in range(S)]
         for chunk in chunks
     ]
 
-    # Running-mean reference initialised from chunk 0
-    ref     = list(all_embs[0])   # list of S tensors [F]
-    aligned = [chunks[0]]
+    # Choose the anchor: chunk whose streams are most distinct from each other.
+    # For S=2: separation_confidence = 1 − cos_sim(stream0, stream1).
+    # Higher → cleaner separation → more reliable speaker identity.
+    def separation_confidence(embs):
+        cos = sum(
+            F.cosine_similarity(embs[a].unsqueeze(0), embs[b].unsqueeze(0)).item()
+            for a in range(S) for b in range(S) if a != b
+        ) / (S * (S - 1))
+        return 1.0 - cos  # 0 = identical streams, 1 = fully orthogonal
 
-    for i in range(1, len(chunks)):
+    confs = [separation_confidence(e) for e in all_embs]
+    anchor_idx = int(max(range(len(chunks)), key=lambda i: confs[i]))
+    print(f"  [Align] anchor=chunk {anchor_idx}  confidence={confs[anchor_idx]:.3f}")
+
+    anchor_embs = all_embs[anchor_idx]
+    aligned = [None] * len(chunks)
+    aligned[anchor_idx] = chunks[anchor_idx]
+
+    for i in range(len(chunks)):
+        if i == anchor_idx:
+            continue
         cur_embs = all_embs[i]
 
         best_perm = list(range(S))
         best_sim  = -float("inf")
         for perm in permutations(range(S)):
             sim = sum(
-                F.cosine_similarity(ref[j].unsqueeze(0), cur_embs[perm[j]].unsqueeze(0)).item()
+                F.cosine_similarity(anchor_embs[j].unsqueeze(0), cur_embs[perm[j]].unsqueeze(0)).item()
                 for j in range(S)
             ) / S
             if sim > best_sim:
                 best_sim = sim
                 best_perm = list(perm)
 
-        aligned_chunk = chunks[i][best_perm]
-        aligned_embs  = [cur_embs[best_perm[s]] for s in range(S)]
-
-        # Update running mean — equal weight per chunk so reference becomes
-        # more stable (lower variance) with each added chunk
-        for s in range(S):
-            ref[s] = (ref[s] * i + aligned_embs[s]) / (i + 1)
-
-        aligned.append(aligned_chunk)
+        aligned[i] = chunks[i][best_perm]
 
     return aligned
 
