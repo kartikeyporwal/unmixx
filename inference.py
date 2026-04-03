@@ -150,13 +150,22 @@ def ensure_2d_channels_first(x: torch.Tensor):
         x = x.unsqueeze(0)
     return x
 
-def _align_to_previous(prev: torch.Tensor, cur: torch.Tensor, compare_samples: int = 2400) -> torch.Tensor:
+def _align_to_previous(
+    prev: torch.Tensor,
+    cur: torch.Tensor,
+    compare_samples: int = 24000,
+    min_confidence: float = 0.01,
+) -> torch.Tensor:
     """
     Ensure speaker ordering in `cur` is consistent with `prev` by comparing
     the tail of `prev` against the head of `cur` for every permutation.
     Returns `cur` with speakers reordered if needed.
 
-    prev, cur : [S, T]  on CPU
+    prev, cur         : [S, T]  on CPU
+    compare_samples   : how many boundary samples to compare (default: 24000 = 1s at 24kHz)
+    min_confidence    : minimum difference in similarity scores to commit to a flip.
+                        If both orderings look equally bad (e.g. silence at boundary)
+                        we keep the current ordering rather than flipping randomly.
     """
     n = min(compare_samples, prev.shape[-1], cur.shape[-1])
     ref = prev[:, -n:]   # [S, n]
@@ -164,19 +173,19 @@ def _align_to_previous(prev: torch.Tensor, cur: torch.Tensor, compare_samples: i
     S = prev.shape[0]
 
     from itertools import permutations
-    best_perm = list(range(S))
-    best_sim = -float("inf")
+    scores = {}
     for perm in permutations(range(S)):
-        # Mean per-speaker cosine similarity
-        sim = sum(
+        scores[perm] = sum(
             torch.nn.functional.cosine_similarity(ref[i].unsqueeze(0), cand[perm[i]].unsqueeze(0)).item()
             for i in range(S)
         ) / S
-        if sim > best_sim:
-            best_sim = sim
-            best_perm = list(perm)
 
-    return cur[best_perm]
+    best_perm = max(scores, key=scores.__getitem__)
+    identity  = tuple(range(S))
+    # Only reorder if the best permutation is meaningfully better than identity
+    if best_perm != identity and (scores[best_perm] - scores[identity]) < min_confidence:
+        return cur  # not confident enough — keep current ordering
+    return cur[list(best_perm)]
 
 
 def run_chunked(model, audio_input, chunk_samples, overlap_samples):
@@ -219,9 +228,12 @@ def run_chunked(model, audio_input, chunk_samples, overlap_samples):
         trim_end   = trim_start + (end - start)
         ests = ests[:, trim_start:trim_end]
 
-        # Align speaker ordering to the previous chunk to prevent identity flips
+        # Align speaker ordering to the previous chunk to prevent identity flips.
+        # Use the full overlap window as the comparison region — much more
+        # reliable than a short boundary snippet, especially when there is
+        # silence or a rapid speech transition right at the boundary.
         if output_chunks:
-            ests = _align_to_previous(output_chunks[-1], ests)
+            ests = _align_to_previous(output_chunks[-1], ests, compare_samples=overlap_samples)
 
         output_chunks.append(ests)
         chunk_idx += 1
