@@ -417,10 +417,11 @@ def main():
     parser.add_argument("--silence_gate_db", type=float, default=-40.0,
                         help="Streams whose energy is more than this many dB below the mixture "
                              "are zeroed out (default: -40). Set to -inf to disable.")
-    parser.add_argument("--no_wiener", action="store_true",
-                        help="Disable Wiener post-filtering (on by default). "
-                             "Wiener filtering sharpens separation by re-applying "
-                             "power-ratio masks to the original mixture spectrum.")
+    parser.add_argument("--wiener", action="store_true",
+                        help="Enable Wiener post-filtering (off by default). "
+                             "Only use this when the model already produces a reasonable "
+                             "initial separation — it sharpens good masks but collapses "
+                             "poor ones, making both outputs identical.")
     parser.add_argument("--mix_strategy", default="auto",
                         choices=["auto", "mean", "left", "right"],
                         help="How to downmix multi-channel input to mono (default: auto). "
@@ -487,9 +488,11 @@ def main():
     # Undo the LUFS gain so output loudness matches the original input
     ests_speech = ests_speech / lufs_gain
 
-    # Wiener post-filtering: sharpen masks using the model's initial estimates.
-    # The LUFS-normalised mono mixture is needed for this step.
-    if not args.no_wiener:
+    # Wiener post-filtering (opt-in via --wiener).
+    # Only beneficial when the model's initial separation is already directionally
+    # correct.  When masks are uncertain (P1 ≈ P2), Wiener collapses both outputs
+    # to 0.5×mixture, making them identical — worse than the raw model output.
+    if args.wiener:
         print("[Wiener] applying post-filter...")
         mono_mixture = audio_input[0].cpu()  # [1, T] — LUFS-normalised
         cfg = config["audionet"]["audionet_config"]
