@@ -118,11 +118,44 @@ def ensure_2d_channels_first(x: torch.Tensor):
         x = x.unsqueeze(0)
     return x
 
+def _align_to_previous(prev: torch.Tensor, cur: torch.Tensor, compare_samples: int = 2400) -> torch.Tensor:
+    """
+    Ensure speaker ordering in `cur` is consistent with `prev` by comparing
+    the tail of `prev` against the head of `cur` for every permutation.
+    Returns `cur` with speakers reordered if needed.
+
+    prev, cur : [S, T]  on CPU
+    """
+    n = min(compare_samples, prev.shape[-1], cur.shape[-1])
+    ref = prev[:, -n:]   # [S, n]
+    cand = cur[:, :n]    # [S, n]
+    S = prev.shape[0]
+
+    from itertools import permutations
+    best_perm = list(range(S))
+    best_sim = -float("inf")
+    for perm in permutations(range(S)):
+        # Mean per-speaker cosine similarity
+        sim = sum(
+            torch.nn.functional.cosine_similarity(ref[i].unsqueeze(0), cand[perm[i]].unsqueeze(0)).item()
+            for i in range(S)
+        ) / S
+        if sim > best_sim:
+            best_sim = sim
+            best_perm = list(perm)
+
+    return cur[best_perm]
+
+
 def run_chunked(model, audio_input, chunk_samples, overlap_samples):
     """
     Process long audio in chunks to fit in GPU memory.
     Each chunk is fed with extra context on both sides; the context is stripped
     from the output before concatenation, avoiding hard boundary artifacts.
+
+    After separation, each chunk's speaker ordering is aligned to the previous
+    chunk using cosine similarity so that speaker identities do not flip between
+    chunks.
 
     audio_input : [1, C, T]  (already on device)
     Returns     : [num_speakers, T]  (on CPU)
@@ -153,6 +186,10 @@ def run_chunked(model, audio_input, chunk_samples, overlap_samples):
         trim_start = start - ctx_start
         trim_end   = trim_start + (end - start)
         ests = ests[:, trim_start:trim_end]
+
+        # Align speaker ordering to the previous chunk to prevent identity flips
+        if output_chunks:
+            ests = _align_to_previous(output_chunks[-1], ests)
 
         output_chunks.append(ests)
         chunk_idx += 1
