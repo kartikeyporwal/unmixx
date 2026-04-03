@@ -118,6 +118,50 @@ def ensure_2d_channels_first(x: torch.Tensor):
         x = x.unsqueeze(0)
     return x
 
+def run_chunked(model, audio_input, chunk_samples, overlap_samples):
+    """
+    Process long audio in chunks to fit in GPU memory.
+    Each chunk is fed with extra context on both sides; the context is stripped
+    from the output before concatenation, avoiding hard boundary artifacts.
+
+    audio_input : [1, C, T]  (already on device)
+    Returns     : [num_speakers, T]  (on CPU)
+    """
+    _, _, T = audio_input.shape
+    output_chunks = []
+
+    start = 0
+    chunk_idx = 0
+    while start < T:
+        end = min(start + chunk_samples, T)
+
+        # Extend with context on both sides where available
+        ctx_start = max(0, start - overlap_samples)
+        ctx_end   = min(T, end   + overlap_samples)
+
+        chunk = audio_input[:, :, ctx_start:ctx_end]  # [1, C, ctx_len]
+
+        with torch.no_grad():
+            outs = model(chunk, istest=True)
+
+        ests, _ = normalize_outputs(outs)
+        if ests.dim() == 2:
+            ests = ests.unsqueeze(0)
+        ests = ests[0].cpu()  # [S, ctx_len]
+
+        # Strip the context padding to get only [start, end)
+        trim_start = start - ctx_start
+        trim_end   = trim_start + (end - start)
+        ests = ests[:, trim_start:trim_end]
+
+        output_chunks.append(ests)
+        chunk_idx += 1
+        print(f"  chunk {chunk_idx}: samples [{start}, {end}) / {T}")
+
+        start = end
+
+    return torch.cat(output_chunks, dim=1)  # [S, T]
+
 # =========================
 # Main
 # =========================
@@ -129,6 +173,11 @@ def main():
     parser.add_argument("--output_dir", default="separated_audio", help="Output directory.")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Device selection.")
     parser.add_argument("--target_sr", type=int, default=None, help="Override target sample rate. (optional)")
+    parser.add_argument("--chunk_len", type=float, default=30.0,
+                        help="Chunk length in seconds for chunked inference (default: 30). "
+                             "Reduce if you still OOM.")
+    parser.add_argument("--overlap", type=float, default=1.0,
+                        help="Context overlap in seconds on each side of a chunk (default: 1).")
     args = parser.parse_args()
 
     # Device
@@ -158,21 +207,25 @@ def main():
     audio_input, waveform_cpu, sr = prepare_audio_tensor(args.audio_path, target_sr, device)
     print(f"[Audio] shape (B,C,T)={tuple(audio_input.shape)}, sr={sr}")
 
-    # Forward
-    with torch.no_grad():
-        outs = model(audio_input, istest=True)
+    # Forward (chunked to fit in GPU memory)
+    T = audio_input.shape[-1]
+    chunk_samples   = int(args.chunk_len * target_sr)
+    overlap_samples = int(args.overlap   * target_sr)
 
-    ests_speech, ests_speech_original = normalize_outputs(outs)
-    # [B, S, T] 또는 [S, T]
-    if ests_speech.dim() == 2:
-        # [S, T] -> [1, S, T]
-        ests_speech = ests_speech.unsqueeze(0)
-    if ests_speech_original.dim() == 2:
-        ests_speech_original = ests_speech_original.unsqueeze(0)
+    if T <= chunk_samples:
+        # Short enough to run in one shot
+        print("[Inference] single pass")
+        with torch.no_grad():
+            outs = model(audio_input, istest=True)
+        ests_speech, _ = normalize_outputs(outs)
+        if ests_speech.dim() == 2:
+            ests_speech = ests_speech.unsqueeze(0)
+        ests_speech = ests_speech[0].cpu()  # [S, T]
+    else:
+        print(f"[Inference] chunked — chunk={args.chunk_len}s, overlap={args.overlap}s")
+        ests_speech = run_chunked(model, audio_input, chunk_samples, overlap_samples)
 
-    # 첫 배치만 사용
-    ests_speech = ests_speech[0].cpu()             # [S, T]
-    ests_speech_original = ests_speech_original[0].cpu()  # [S, T]
+    ests_speech_original = ests_speech  # same for save purposes
     num_speakers = ests_speech.shape[0]
     print(f"[Separation] detected {num_speakers} streams")
 
