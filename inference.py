@@ -222,6 +222,54 @@ def ensure_2d_channels_first(x: torch.Tensor):
         x = x.unsqueeze(0)
     return x
 
+def wiener_refine(
+    mixture: torch.Tensor,
+    estimates: torch.Tensor,
+    win: int = 960,
+    stride: int = 240,
+) -> torch.Tensor:
+    """
+    Sharpen separated estimates using Wiener post-filtering.
+
+    The model's first-pass estimates are used to build per-source power masks
+    which are then applied to the original mixture spectrum.  This guarantees
+    energy conservation (sources still sum to the mixture) and suppresses bleed
+    by amplifying confident assignments and attenuating uncertain ones.
+
+    mixture   : [1, T]  mono mixture (CPU, float32)
+    estimates : [S, T]  model separated estimates (CPU, float32)
+    win/stride: must match the model's STFT settings (default 960/240)
+    Returns   : [S, T]  refined estimates
+    """
+    nsample = mixture.shape[-1]
+    window  = torch.hann_window(win)
+
+    mix_spec = torch.stft(
+        mixture[0], n_fft=win, hop_length=stride, window=window, return_complex=True
+    )  # [F, T_frames]
+
+    # Power spectral density of each estimated source
+    powers = []
+    for i in range(estimates.shape[0]):
+        s = torch.stft(
+            estimates[i], n_fft=win, hop_length=stride, window=window, return_complex=True
+        )
+        powers.append(s.abs().pow(2))
+
+    total_power = sum(powers).clamp(min=1e-10)  # [F, T_frames]
+
+    refined = []
+    for p in powers:
+        mask         = p / total_power          # Wiener mask ∈ [0, 1]
+        refined_spec = mask * mix_spec          # apply to original mixture
+        refined_wav  = torch.istft(
+            refined_spec, n_fft=win, hop_length=stride, window=window, length=nsample
+        )
+        refined.append(refined_wav)
+
+    return torch.stack(refined)  # [S, T]
+
+
 def _best_perm(ref: torch.Tensor, cand: torch.Tensor, min_confidence: float = 0.01) -> list:
     """
     Find the permutation of speakers in `cand` [S, T] that best matches `ref` [S, T].
@@ -369,6 +417,10 @@ def main():
     parser.add_argument("--silence_gate_db", type=float, default=-40.0,
                         help="Streams whose energy is more than this many dB below the mixture "
                              "are zeroed out (default: -40). Set to -inf to disable.")
+    parser.add_argument("--no_wiener", action="store_true",
+                        help="Disable Wiener post-filtering (on by default). "
+                             "Wiener filtering sharpens separation by re-applying "
+                             "power-ratio masks to the original mixture spectrum.")
     parser.add_argument("--mix_strategy", default="auto",
                         choices=["auto", "mean", "left", "right"],
                         help="How to downmix multi-channel input to mono (default: auto). "
@@ -434,6 +486,19 @@ def main():
 
     # Undo the LUFS gain so output loudness matches the original input
     ests_speech = ests_speech / lufs_gain
+
+    # Wiener post-filtering: sharpen masks using the model's initial estimates.
+    # The LUFS-normalised mono mixture is needed for this step.
+    if not args.no_wiener:
+        print("[Wiener] applying post-filter...")
+        mono_mixture = audio_input[0].cpu()  # [1, T] — LUFS-normalised
+        cfg = config["audionet"]["audionet_config"]
+        ests_speech = wiener_refine(
+            mono_mixture,
+            ests_speech * lufs_gain,   # back to normalised scale for the filter
+            win=cfg.get("win", 960),
+            stride=cfg.get("stride", 240),
+        ) / lufs_gain                  # restore original loudness scale
 
     ests_speech_original = ests_speech  # same for save purposes
     ests_speech = gate_silent_streams(ests_speech, threshold_db=args.silence_gate_db)
