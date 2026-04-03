@@ -103,18 +103,67 @@ def lufs_normalize(waveform: torch.Tensor, sr: int, target_lufs: float = _TRAIN_
     return waveform * gain_linear, gain_linear
 
 
-def prepare_audio_tensor(audio_path: str, target_sr: int, device: torch.device):
+_STEREO_CORR_THRESHOLD = 0.98  # L/R correlation above this → treat as true mono
+
+
+def stereo_correlation(waveform: torch.Tensor) -> float:
+    """Pearson correlation between L and R channels. waveform: [2, T]"""
+    L = waveform[0].double()
+    R = waveform[1].double()
+    L = L - L.mean()
+    R = R - R.mean()
+    denom = (L.norm() * R.norm()).clamp(min=1e-10)
+    return (L @ R / denom).item()
+
+
+def prepare_audio_tensor(audio_path: str, target_sr: int, device: torch.device,
+                         mix_strategy: str = "auto"):
+    """
+    Load audio, resample, and downmix to mono for the model.
+
+    mix_strategy:
+      "auto"  — for stereo: check L/R correlation; if channels are very similar
+                (corr > 0.98) use mean; if they differ significantly, report it
+                so the user can choose a better strategy.
+      "mean"  — average all channels (safe default)
+      "left"  — use left (channel 0) only
+      "right" — use right (channel 1) only
+    """
     waveform, original_sr = torchaudio.load(audio_path)  # [C, T]
     if original_sr != target_sr:
         resampler = T.Resample(orig_freq=original_sr, new_freq=target_sr)
         waveform = resampler(waveform)
-    # Downmix to mono. The model was trained on mono and its internal energy-
-    # correction formula assumes nch=1; passing stereo produces garbage output.
-    # We preserve the original stereo waveform for saving the mixture file.
-    waveform_for_save = waveform
-    if waveform.shape[0] > 1:
-        print(f"[Audio] {waveform.shape[0]}-channel input — downmixing to mono")
-        waveform = waveform.mean(dim=0, keepdim=True)  # [1, T]
+
+    waveform_for_save = waveform  # keep original for saving mixture.wav
+
+    nch = waveform.shape[0]
+    if nch == 1:
+        pass  # already mono
+    elif nch >= 2:
+        if mix_strategy == "left":
+            print(f"[Audio] {nch}-channel input — using left channel only")
+            waveform = waveform[0:1]
+        elif mix_strategy == "right":
+            print(f"[Audio] {nch}-channel input — using right channel only")
+            waveform = waveform[1:2]
+        else:
+            # "mean" or "auto"
+            if mix_strategy == "auto" and nch == 2:
+                corr = stereo_correlation(waveform[:2])
+                if corr < _STEREO_CORR_THRESHOLD:
+                    print(
+                        f"[Audio] Stereo L/R correlation = {corr:.3f} — channels carry "
+                        f"different content (speakers may be panned). "
+                        f"Using mean downmix. Try --mix_strategy left or right if one "
+                        f"channel has the cleaner mixture."
+                    )
+                else:
+                    print(f"[Audio] Stereo L/R correlation = {corr:.3f} — near-identical "
+                          f"channels, treating as mono (mean downmix).")
+            else:
+                print(f"[Audio] {nch}-channel input — downmixing to mono (mean)")
+            waveform = waveform.mean(dim=0, keepdim=True)  # [1, T]
+
     audio_input = waveform.unsqueeze(0).to(device)  # [1, 1, T]
     return audio_input, waveform_for_save, target_sr
 
@@ -286,6 +335,13 @@ def main():
     parser.add_argument("--silence_gate_db", type=float, default=-40.0,
                         help="Streams whose energy is more than this many dB below the mixture "
                              "are zeroed out (default: -40). Set to -inf to disable.")
+    parser.add_argument("--mix_strategy", default="auto",
+                        choices=["auto", "mean", "left", "right"],
+                        help="How to downmix multi-channel input to mono (default: auto). "
+                             "auto: checks L/R correlation and warns if channels differ. "
+                             "mean: average all channels. "
+                             "left/right: use only that channel — useful when speakers are "
+                             "panned and one channel gives a better balanced mixture.")
     args = parser.parse_args()
 
     # Device
@@ -312,7 +368,8 @@ def main():
 
     # Audio
     print(f"[Audio] loading: {args.audio_path}")
-    audio_input, waveform_cpu, sr = prepare_audio_tensor(args.audio_path, target_sr, device)
+    audio_input, waveform_cpu, sr = prepare_audio_tensor(args.audio_path, target_sr, device,
+                                                          mix_strategy=args.mix_strategy)
     print(f"[Audio] shape (B,C,T)={tuple(audio_input.shape)}, sr={sr}")
 
     # LUFS normalisation — the model was trained with mixtures normalised to
