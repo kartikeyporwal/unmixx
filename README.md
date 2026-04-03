@@ -52,7 +52,7 @@ Outputs will be saved to `separated_audio/`.
 | `--overlap` | `1.0` | Context overlap in seconds on each side of a chunk. |
 | `--mix_strategy` | `auto` | How to downmix multi-channel input: `auto`, `mean`, `left`, `right`. `auto` measures L/R correlation and warns when channels carry different content. |
 | `--silence_gate_db` | `-40.0` | Zero out streams more than N dB below the mixture (e.g. absent speaker). Set to `-inf` to disable. |
-| `--wiener` | off | Enable Wiener post-filtering. Sharpens good separations; do not use when separation quality is already poor. |
+| `--mask_sharpness ALPHA` | off | Generalised Wiener post-filter: `M_i = P_i^α / ΣP_j^α`. `1.0` = standard Wiener, `2.0` = less bleed, `4.0+` ≈ hard masking. Only use when the initial separation is already directionally correct. |
 | `--device` | `auto` | `auto`, `cpu`, or `cuda`. |
 
 > **Note:** This model separates exactly **2 speakers/singers**. It was trained exclusively on singing voice mixtures.

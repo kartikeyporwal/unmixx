@@ -225,20 +225,26 @@ def ensure_2d_channels_first(x: torch.Tensor):
 def wiener_refine(
     mixture: torch.Tensor,
     estimates: torch.Tensor,
+    alpha: float = 1.0,
     win: int = 960,
     stride: int = 240,
 ) -> torch.Tensor:
     """
-    Sharpen separated estimates using Wiener post-filtering.
+    Sharpen separated estimates using generalised Wiener post-filtering.
 
-    The model's first-pass estimates are used to build per-source power masks
-    which are then applied to the original mixture spectrum.  This guarantees
-    energy conservation (sources still sum to the mixture) and suppresses bleed
-    by amplifying confident assignments and attenuating uncertain ones.
+    Mask formula:  M_i = P_i^alpha / sum_j(P_j^alpha)
+
+      alpha = 1  → standard Wiener (soft, lowest artefacts)
+      alpha = 2  → more aggressive, noticeably less bleed
+      alpha = 4+ → near hard-masking (winner takes all per TF bin)
+
+    The masks are applied to the *original* mixture spectrum, so sources
+    always sum back to the mixture (energy conservation).
 
     mixture   : [1, T]  mono mixture (CPU, float32)
     estimates : [S, T]  model separated estimates (CPU, float32)
-    win/stride: must match the model's STFT settings (default 960/240)
+    alpha     : sharpness exponent (default 1.0)
+    win/stride: must match the model's STFT settings
     Returns   : [S, T]  refined estimates
     """
     nsample = mixture.shape[-1]
@@ -248,20 +254,20 @@ def wiener_refine(
         mixture[0], n_fft=win, hop_length=stride, window=window, return_complex=True
     )  # [F, T_frames]
 
-    # Power spectral density of each estimated source
-    powers = []
+    # Power spectral density of each estimated source, raised to alpha
+    powers_alpha = []
     for i in range(estimates.shape[0]):
         s = torch.stft(
             estimates[i], n_fft=win, hop_length=stride, window=window, return_complex=True
         )
-        powers.append(s.abs().pow(2))
+        powers_alpha.append(s.abs().pow(2 * alpha))   # |S|^(2*alpha)
 
-    total_power = sum(powers).clamp(min=1e-10)  # [F, T_frames]
+    total = sum(powers_alpha).clamp(min=1e-10)
 
     refined = []
-    for p in powers:
-        mask         = p / total_power          # Wiener mask ∈ [0, 1]
-        refined_spec = mask * mix_spec          # apply to original mixture
+    for pa in powers_alpha:
+        mask         = pa / total               # sharpened mask ∈ [0, 1]
+        refined_spec = mask * mix_spec
         refined_wav  = torch.istft(
             refined_spec, n_fft=win, hop_length=stride, window=window, length=nsample
         )
@@ -417,11 +423,14 @@ def main():
     parser.add_argument("--silence_gate_db", type=float, default=-40.0,
                         help="Streams whose energy is more than this many dB below the mixture "
                              "are zeroed out (default: -40). Set to -inf to disable.")
-    parser.add_argument("--wiener", action="store_true",
-                        help="Enable Wiener post-filtering (off by default). "
-                             "Only use this when the model already produces a reasonable "
-                             "initial separation — it sharpens good masks but collapses "
-                             "poor ones, making both outputs identical.")
+    parser.add_argument("--mask_sharpness", type=float, default=None,
+                        metavar="ALPHA",
+                        help="Apply generalised Wiener post-filtering with exponent ALPHA. "
+                             "M_i = P_i^ALPHA / sum(P_j^ALPHA). "
+                             "1.0 = standard Wiener (soft), 2.0 = less bleed, "
+                             "4.0+ = near hard-masking. "
+                             "Not set by default — only use when the model already "
+                             "produces a directionally correct initial separation.")
     parser.add_argument("--mix_strategy", default="auto",
                         choices=["auto", "mean", "left", "right"],
                         help="How to downmix multi-channel input to mono (default: auto). "
@@ -488,17 +497,21 @@ def main():
     # Undo the LUFS gain so output loudness matches the original input
     ests_speech = ests_speech / lufs_gain
 
-    # Wiener post-filtering (opt-in via --wiener).
-    # Only beneficial when the model's initial separation is already directionally
-    # correct.  When masks are uncertain (P1 ≈ P2), Wiener collapses both outputs
-    # to 0.5×mixture, making them identical — worse than the raw model output.
-    if args.wiener:
-        print("[Wiener] applying post-filter...")
+    # Generalised Wiener post-filtering (opt-in via --mask_sharpness).
+    # M_i = P_i^alpha / sum(P_j^alpha).  alpha=1 is standard Wiener;
+    # higher alpha sharpens masks and reduces bleed.
+    # Only beneficial when the model already produces directionally correct
+    # separation — when masks are uncertain (P1≈P2) any alpha collapses
+    # both outputs to 0.5×mixture.
+    if args.mask_sharpness is not None:
+        alpha = args.mask_sharpness
+        print(f"[MaskSharpness] applying post-filter (alpha={alpha})...")
         mono_mixture = audio_input[0].cpu()  # [1, T] — LUFS-normalised
         cfg = config["audionet"]["audionet_config"]
         ests_speech = wiener_refine(
             mono_mixture,
             ests_speech * lufs_gain,   # back to normalised scale for the filter
+            alpha=alpha,
             win=cfg.get("win", 960),
             stride=cfg.get("stride", 240),
         ) / lufs_gain                  # restore original loudness scale
