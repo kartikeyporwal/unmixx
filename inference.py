@@ -62,19 +62,24 @@ def load_state_dict_safely(model: torch.nn.Module, ckpt_path: str):
         # 바로 state_dict로 저장된 형태
         state_dict = ckpt
 
-    try:
-        # 바로 로드가 되면 끝
-        model.load_state_dict(state_dict, strict=True)
-        return
-    except Exception:
-        # prefix 정리 (예: "audio_model.")
-        converted = {}
-        for k, v in state_dict.items():
-            if k.startswith("audio_model."):
-                converted[k[len("audio_model."):]] = v
-            else:
-                converted[k] = v
-        model.load_state_dict(converted, strict=True)
+    # Strip "audio_model." prefix added by the Lightning wrapper
+    converted = {}
+    for k, v in state_dict.items():
+        if k.startswith("audio_model."):
+            converted[k[len("audio_model."):]] = v
+        else:
+            converted[k] = v
+
+    # Backfill any registered buffers that are absent from older checkpoints
+    # (e.g. _hann_window added after the checkpoint was saved).  Buffers are
+    # computed values, not learned, so keeping the freshly-initialised value
+    # is always correct.
+    model_sd = model.state_dict()
+    for k, v in model_sd.items():
+        if k not in converted:
+            converted[k] = v
+
+    model.load_state_dict(converted, strict=True)
 
 def prepare_audio_tensor(audio_path: str, target_sr: int, device: torch.device):
     waveform, original_sr = torchaudio.load(audio_path)  # [C, T]
