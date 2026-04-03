@@ -86,9 +86,15 @@ def prepare_audio_tensor(audio_path: str, target_sr: int, device: torch.device):
     if original_sr != target_sr:
         resampler = T.Resample(orig_freq=original_sr, new_freq=target_sr)
         waveform = resampler(waveform)
-    # [B, C, T] 로
-    audio_input = waveform.unsqueeze(0).to(device)
-    return audio_input, waveform, target_sr  # audio_input: [1, C, T], waveform: [C, T]
+    # Downmix to mono. The model was trained on mono and its internal energy-
+    # correction formula assumes nch=1; passing stereo produces garbage output.
+    # We preserve the original stereo waveform for saving the mixture file.
+    waveform_for_save = waveform
+    if waveform.shape[0] > 1:
+        print(f"[Audio] {waveform.shape[0]}-channel input — downmixing to mono")
+        waveform = waveform.mean(dim=0, keepdim=True)  # [1, T]
+    audio_input = waveform.unsqueeze(0).to(device)  # [1, 1, T]
+    return audio_input, waveform_for_save, target_sr
 
 def normalize_outputs(ests):
     """
