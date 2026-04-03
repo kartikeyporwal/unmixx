@@ -276,11 +276,11 @@ def main():
     parser.add_argument("--output_dir", default="separated_audio", help="Output directory.")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Device selection.")
     parser.add_argument("--target_sr", type=int, default=None, help="Override target sample rate. (optional)")
-    parser.add_argument("--chunk_len", type=float, default=10.0,
-                        help="Chunk length in seconds for chunked inference (default: 10). "
-                             "The model was trained on 4s segments; shorter chunks (5-10s) "
-                             "give better separation quality than the old 30s default, "
-                             "especially for speech. Reduce further if you OOM.")
+    parser.add_argument("--chunk_len", type=float, default=30.0,
+                        help="Chunk length in seconds for chunked inference (default: 30). "
+                             "Reduce if you OOM. Avoid going below ~15s — shorter chunks "
+                             "increase the number of chunk-boundary alignments and raise "
+                             "the risk of a speaker identity flip.")
     parser.add_argument("--overlap", type=float, default=1.0,
                         help="Context overlap in seconds on each side of a chunk (default: 1).")
     parser.add_argument("--silence_gate_db", type=float, default=-40.0,
