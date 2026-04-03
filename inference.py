@@ -7,9 +7,11 @@ import yaml
 from pathlib import Path
 from pprint import pprint
 
+import numpy as np
 import torch
 import torchaudio
 import torchaudio.transforms as T
+import pyloudnorm as pyln
 import look2hear.models
 
 # (옵션) salience 시각화 유틸이 필요하면 주석 해제
@@ -80,6 +82,26 @@ def load_state_dict_safely(model: torch.nn.Module, ckpt_path: str):
             converted[k] = v
 
     model.load_state_dict(converted, strict=True)
+
+_TRAIN_LUFS = -24.0  # loudness used during training (from singing_dataset.py)
+
+
+def lufs_normalize(waveform: torch.Tensor, sr: int, target_lufs: float = _TRAIN_LUFS):
+    """
+    Normalize waveform to target_lufs (integrated loudness).
+    Returns (normalized_waveform, linear_gain) so the gain can be inverted later.
+    waveform : [1, T]  float32
+    """
+    meter = pyln.Meter(sr)
+    audio_np = waveform[0].numpy().astype(np.float64)
+    measured = meter.integrated_loudness(audio_np)
+    if np.isinf(measured):
+        # Silence — nothing to normalize
+        return waveform, 1.0
+    gain_db = target_lufs - measured
+    gain_linear = 10 ** (gain_db / 20.0)
+    return waveform * gain_linear, gain_linear
+
 
 def prepare_audio_tensor(audio_path: str, target_sr: int, device: torch.device):
     waveform, original_sr = torchaudio.load(audio_path)  # [C, T]
@@ -254,9 +276,11 @@ def main():
     parser.add_argument("--output_dir", default="separated_audio", help="Output directory.")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Device selection.")
     parser.add_argument("--target_sr", type=int, default=None, help="Override target sample rate. (optional)")
-    parser.add_argument("--chunk_len", type=float, default=30.0,
-                        help="Chunk length in seconds for chunked inference (default: 30). "
-                             "Reduce if you still OOM.")
+    parser.add_argument("--chunk_len", type=float, default=10.0,
+                        help="Chunk length in seconds for chunked inference (default: 10). "
+                             "The model was trained on 4s segments; shorter chunks (5-10s) "
+                             "give better separation quality than the old 30s default, "
+                             "especially for speech. Reduce further if you OOM.")
     parser.add_argument("--overlap", type=float, default=1.0,
                         help="Context overlap in seconds on each side of a chunk (default: 1).")
     parser.add_argument("--silence_gate_db", type=float, default=-40.0,
@@ -291,6 +315,14 @@ def main():
     audio_input, waveform_cpu, sr = prepare_audio_tensor(args.audio_path, target_sr, device)
     print(f"[Audio] shape (B,C,T)={tuple(audio_input.shape)}, sr={sr}")
 
+    # LUFS normalisation — the model was trained with mixtures normalised to
+    # -24 LUFS (see singing_dataset.py).  Un-normalised speech input is out of
+    # distribution and degrades separation quality.  We normalise before
+    # inference and undo the gain on the outputs so saved loudness is preserved.
+    norm_waveform, lufs_gain = lufs_normalize(audio_input[0].cpu(), sr)
+    audio_input = norm_waveform.unsqueeze(0).to(device)
+    print(f"[LUFS] normalised input to {_TRAIN_LUFS} LUFS (gain={lufs_gain:.4f})")
+
     # Forward (chunked to fit in GPU memory)
     T = audio_input.shape[-1]
     chunk_samples   = int(args.chunk_len * target_sr)
@@ -308,6 +340,9 @@ def main():
     else:
         print(f"[Inference] chunked — chunk={args.chunk_len}s, overlap={args.overlap}s")
         ests_speech = run_chunked(model, audio_input, chunk_samples, overlap_samples)
+
+    # Undo the LUFS gain so output loudness matches the original input
+    ests_speech = ests_speech / lufs_gain
 
     ests_speech_original = ests_speech  # same for save purposes
     ests_speech = gate_silent_streams(ests_speech, threshold_db=args.silence_gate_db)
