@@ -276,42 +276,79 @@ def wiener_refine(
     return torch.stack(refined)  # [S, T]
 
 
-def _best_perm(ref: torch.Tensor, cand: torch.Tensor, min_confidence: float = 0.01) -> list:
+def _stream_embedding(waveform: torch.Tensor, win: int = 960, stride: int = 240) -> torch.Tensor:
     """
-    Find the permutation of speakers in `cand` [S, T] that best matches `ref` [S, T].
-    Uses cosine similarity in the spectral magnitude domain — more robust than
-    raw waveform comparison because it's invariant to phase differences.
-    Returns the best permutation as a list of indices, or identity if not confident.
+    Speaker-representative embedding: average log-magnitude spectrum over time → [F].
+    Captures spectral envelope (timbre), which is speaker-dependent and stable
+    across chunks. Phase-invariant so it works even when two chunks process the
+    same audio with different context and produce slightly different phase.
+    Memory cost: (win//2 + 1) floats ≈ 2 KB per stream.
+    """
+    window = torch.hann_window(win)
+    spec   = torch.stft(waveform, n_fft=win, hop_length=stride, window=window, return_complex=True)
+    return spec.abs().clamp(min=1e-8).log().mean(dim=-1)  # [F]
+
+
+def _global_align(chunks: list, win: int = 960, stride: int = 240) -> list:
+    """
+    Globally align speaker ordering across all chunks using a running-mean
+    spectral embedding.
+
+    Each chunk is compared against the cumulative average embedding of all
+    previously confirmed chunks (not just its immediate neighbour).
+    A single bad alignment cannot cascade: later chunks still compare against
+    the growing majority of correctly-aligned chunks and self-correct.
+
+    RAM overhead: num_chunks × S × (win//2+1) floats.
+      2h audio, 30s chunks → 240 × 2 × 481 × 4B ≈ 0.9 MB.
+    The chunks themselves are already held in RAM before torch.cat.
+
+    chunks : list of [S, T] CPU tensors
+    Returns: list of [S, T] CPU tensors with consistent speaker ordering
     """
     from itertools import permutations
+    import torch.nn.functional as F
 
-    S = ref.shape[0]
-    identity = tuple(range(S))
+    if len(chunks) <= 1:
+        return chunks
 
-    # Spectral magnitude: more stable than raw waveform cosine similarity
-    # because phase can differ even for the same speaker across chunks.
-    def spec_mag(x):
-        # x: [T] → magnitude spectrum averaged over time  [F]
-        w = torch.hann_window(512, device=x.device)
-        s = torch.stft(x, n_fft=512, hop_length=128, window=w, return_complex=True)
-        return s.abs().mean(dim=-1)  # [F]
+    S = chunks[0].shape[0]
 
-    ref_specs  = [spec_mag(ref[i])  for i in range(S)]
-    cand_specs = [spec_mag(cand[i]) for i in range(S)]
+    # Pre-compute per-stream embeddings for every chunk
+    all_embs = [
+        [_stream_embedding(chunk[s], win, stride) for s in range(S)]
+        for chunk in chunks
+    ]
 
-    scores = {}
-    for perm in permutations(range(S)):
-        scores[perm] = sum(
-            torch.nn.functional.cosine_similarity(
-                ref_specs[i].unsqueeze(0), cand_specs[perm[i]].unsqueeze(0)
-            ).item()
-            for i in range(S)
-        ) / S
+    # Running-mean reference initialised from chunk 0
+    ref     = list(all_embs[0])   # list of S tensors [F]
+    aligned = [chunks[0]]
 
-    best_perm = max(scores, key=scores.__getitem__)
-    if best_perm != identity and (scores[best_perm] - scores[identity]) < min_confidence:
-        return list(identity)  # not confident enough — keep current ordering
-    return list(best_perm)
+    for i in range(1, len(chunks)):
+        cur_embs = all_embs[i]
+
+        best_perm = list(range(S))
+        best_sim  = -float("inf")
+        for perm in permutations(range(S)):
+            sim = sum(
+                F.cosine_similarity(ref[j].unsqueeze(0), cur_embs[perm[j]].unsqueeze(0)).item()
+                for j in range(S)
+            ) / S
+            if sim > best_sim:
+                best_sim = sim
+                best_perm = list(perm)
+
+        aligned_chunk = chunks[i][best_perm]
+        aligned_embs  = [cur_embs[best_perm[s]] for s in range(S)]
+
+        # Update running mean — equal weight per chunk so reference becomes
+        # more stable (lower variance) with each added chunk
+        for s in range(S):
+            ref[s] = (ref[s] * i + aligned_embs[s]) / (i + 1)
+
+        aligned.append(aligned_chunk)
+
+    return aligned
 
 
 def _fmt_time(seconds: float) -> str:
@@ -326,9 +363,10 @@ def run_chunked(model, audio_input, chunk_samples, overlap_samples, sr: int):
     Each chunk is fed with extra context on both sides; the context is stripped
     from the output before concatenation, avoiding hard boundary artifacts.
 
-    After separation, each chunk's speaker ordering is aligned to the previous
-    chunk using cosine similarity so that speaker identities do not flip between
-    chunks.
+    After all chunks are separated, speaker ordering is globally aligned using
+    running-mean spectral embeddings (_global_align).  Each chunk is compared
+    against the cumulative average embedding of all confirmed chunks, so a
+    single bad alignment cannot cascade into subsequent chunks.
 
     audio_input : [1, C, T]  (already on device)
     sr          : sample rate (used for progress display)
@@ -362,23 +400,10 @@ def run_chunked(model, audio_input, chunk_samples, overlap_samples, sr: int):
             ests = ests.unsqueeze(0)
         ests = ests[0].cpu()  # [S, ctx_len]
 
-        # Strip the context padding to get only [start, end)
+        # Strip the context padding — keep only [start, end)
         trim_start = start - ctx_start
         trim_end   = trim_start + (end - start)
-        left_ctx   = ests[:, :trim_start]        # [S, overlap] — same audio as tail of prev chunk
         ests       = ests[:, trim_start:trim_end]
-
-        # Align speaker ordering using the overlap region.
-        #
-        # The left context (left_ctx) covers [ctx_start, start) — the exact same
-        # audio segment that ends the previous chunk's output.  Both chunks
-        # processed that region, possibly assigning speakers in different order.
-        # Comparing them in the spectral domain gives a much stronger alignment
-        # signal than comparing adjacent (but different) audio at boundaries.
-        if output_chunks and left_ctx.shape[-1] > 0:
-            prev_tail = output_chunks[-1][:, -left_ctx.shape[-1]:]
-            perm = _best_perm(prev_tail, left_ctx)
-            ests = ests[perm]
 
         output_chunks.append(ests)
         chunk_idx += 1
@@ -399,6 +424,12 @@ def run_chunked(model, audio_input, chunk_samples, overlap_samples, sr: int):
         )
 
         start = end
+
+    # Global speaker-ordering alignment across all chunks.
+    # Each chunk is compared against the running-mean spectral embedding of all
+    # previously aligned chunks, so errors cannot cascade.
+    print("[Align] running global speaker alignment across chunks...")
+    output_chunks = _global_align(output_chunks, win=960, stride=240)
 
     return torch.cat(output_chunks, dim=1)  # [S, T]
 
