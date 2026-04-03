@@ -800,6 +800,8 @@ class UNMIXX(BaseModel):
         reconstructed = reconstructed + 1 / reconstructed.shape[1] * (
             input.unsqueeze(1) - reconstructed.sum(dim=1, keepdim=True)
         )
+        if istest:
+            return reconstructed, None, None, None, None
         mag1,phase1=self.get_mag_pha_from_stft(sep_subband_spec[:,0])
         mag2,phase2=self.get_mag_pha_from_stft(sep_subband_spec[:,1])
         return reconstructed,mag1,phase1,mag2,phase2
