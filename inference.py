@@ -53,7 +53,7 @@ def build_model(cfg: dict):
     return model
 
 def load_state_dict_safely(model: torch.nn.Module, ckpt_path: str):
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
     # Lightning 스타일 또는 pure state_dict 둘 다 처리
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
