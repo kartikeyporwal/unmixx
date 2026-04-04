@@ -289,76 +289,127 @@ def _stream_embedding(waveform: torch.Tensor, win: int = 960, stride: int = 240)
     return spec.abs().clamp(min=1e-8).log().mean(dim=-1)  # [F]
 
 
-def _global_align(chunks: list, win: int = 960, stride: int = 240) -> list:
+def _global_align(chunks: list, overlaps: list, win: int = 960, stride: int = 240) -> list:
     """
-    Globally align speaker ordering across all chunks.
+    Globally align speaker ordering using overlap regions + Viterbi DP.
 
-    Strategy — anchor-based (cascade-free):
-      1. Compute a log-magnitude spectral embedding [F] for each stream in
-         every chunk.
-      2. Find the "anchor" chunk whose two streams are most spectrally distinct
-         (highest 1 − cosine_similarity between stream embeddings).  The anchor
-         has the clearest separation, so its stream-to-speaker assignment is the
-         most reliable reference.
-      3. Align EVERY other chunk directly to this anchor using cosine similarity.
-         Because all comparisons are against the same fixed reference, there is
-         no cascade: a wrong alignment in chunk i cannot influence chunk i+1.
+    Why overlap regions, not spectral embeddings of chunk content?
+    ---------------------------------------------------------------
+    overlaps[i] is the LEFT CONTEXT of chunk i — the exact same audio
+    segment that ends chunks[i-1]'s output.  Comparing these gives a
+    strong, direct "same order vs. flip" signal because the audio is
+    identical; any difference is purely due to speaker assignment.
+    Content-based embeddings require the speakers to have consistently
+    different timbres across ALL chunks, which fails when separation
+    quality is mediocre.
 
-    RAM: num_chunks × S × (win//2+1) floats.
-      2h @ 30s chunks → 240 × 2 × 481 × 4B ≈ 0.9 MB.
+    Why Viterbi DP instead of sequential propagation?
+    -------------------------------------------------
+    Sequential propagation cascades: one bad boundary vote flips
+    every chunk after it.  Viterbi DP considers ALL boundary votes
+    simultaneously and finds the globally optimal binary assignment
+    (flip / no-flip per chunk).  A low-confidence boundary cannot
+    override the accumulated evidence from all others.
 
-    chunks : list of [S, T] CPU tensors
-    Returns: list of [S, T] CPU tensors with consistent speaker ordering
+    overlaps : list of [S, T_ovl] tensors (overlaps[0] is always empty)
+    chunks   : list of [S, T] tensors
+    Returns  : list of [S, T] tensors with consistent speaker ordering
     """
-    from itertools import permutations
     import torch.nn.functional as F
 
     if len(chunks) <= 1:
         return chunks
 
     S = chunks[0].shape[0]
+    n = len(chunks)
 
-    # Pre-compute per-stream embeddings for every chunk  [N, S, F]
-    all_embs = [
-        [_stream_embedding(chunk[s], win, stride) for s in range(S)]
-        for chunk in chunks
-    ]
+    def stream_emb(x: torch.Tensor):
+        """[T] -> [F] average log-magnitude spectrum; None if too short."""
+        if x.shape[-1] < win:
+            return None
+        window = torch.hann_window(win)
+        spec = torch.stft(x, n_fft=win, hop_length=stride, window=window, return_complex=True)
+        return spec.abs().clamp(min=1e-8).log().mean(dim=-1)
 
-    # Choose the anchor: chunk whose streams are most distinct from each other.
-    # For S=2: separation_confidence = 1 − cos_sim(stream0, stream1).
-    # Higher → cleaner separation → more reliable speaker identity.
-    def separation_confidence(embs):
-        cos = sum(
-            F.cosine_similarity(embs[a].unsqueeze(0), embs[b].unsqueeze(0)).item()
-            for a in range(S) for b in range(S) if a != b
-        ) / (S * (S - 1))
-        return 1.0 - cos  # 0 = identical streams, 1 = fully orthogonal
-
-    confs = [separation_confidence(e) for e in all_embs]
-    anchor_idx = int(max(range(len(chunks)), key=lambda i: confs[i]))
-    print(f"  [Align] anchor=chunk {anchor_idx}  confidence={confs[anchor_idx]:.3f}")
-
-    anchor_embs = all_embs[anchor_idx]
-    aligned = [None] * len(chunks)
-    aligned[anchor_idx] = chunks[anchor_idx]
-
-    for i in range(len(chunks)):
-        if i == anchor_idx:
+    # Compute pairwise (score_same, score_flip) at each chunk boundary.
+    # score_same > score_flip → prefer identity permutation across boundary.
+    pair_scores = []
+    for i in range(n - 1):
+        ovl = overlaps[i + 1]          # left context of chunk i+1  [S, T_ovl]
+        if ovl.shape[-1] < win:
+            pair_scores.append((0.0, 0.0))   # too short: uninformative
             continue
-        cur_embs = all_embs[i]
 
-        best_perm = list(range(S))
-        best_sim  = -float("inf")
-        for perm in permutations(range(S)):
-            sim = sum(
-                F.cosine_similarity(anchor_embs[j].unsqueeze(0), cur_embs[perm[j]].unsqueeze(0)).item()
-                for j in range(S)
-            ) / S
-            if sim > best_sim:
-                best_sim = sim
-                best_perm = list(perm)
+        ovl_len   = ovl.shape[-1]
+        prev_tail = chunks[i][:, -ovl_len:]   # same audio as ovl, from chunk i
 
-        aligned[i] = chunks[i][best_perm]
+        ref_embs = [stream_emb(prev_tail[s]) for s in range(S)]
+        cur_embs = [stream_emb(ovl[s])       for s in range(S)]
+
+        if any(e is None for e in ref_embs + cur_embs):
+            pair_scores.append((0.0, 0.0))
+            continue
+
+        score_same = sum(
+            F.cosine_similarity(ref_embs[s].unsqueeze(0), cur_embs[s].unsqueeze(0)).item()
+            for s in range(S)
+        ) / S
+
+        score_flip = sum(
+            F.cosine_similarity(ref_embs[s].unsqueeze(0), cur_embs[S - 1 - s].unsqueeze(0)).item()
+            for s in range(S)
+        ) / S
+
+        pair_scores.append((score_same, score_flip))
+
+    # Viterbi DP — binary state: 0 = canonical order, 1 = flipped
+    # dp[s] = accumulated score of best path reaching state s at current chunk
+    NEG_INF = -float("inf")
+    dp   = [0.0, NEG_INF]   # chunk 0 is always canonical
+    back = [[None] * n for _ in range(2)]
+
+    prev_dp = dp[:]
+    for i in range(n - 1):
+        score_same, score_flip = pair_scores[i]
+        new_dp   = [NEG_INF, NEG_INF]
+        new_back = [-1, -1]
+
+        for next_s in range(2):
+            for prev_s in range(2):
+                if prev_dp[prev_s] == NEG_INF:
+                    continue
+                potential = score_same if prev_s == next_s else score_flip
+                total = prev_dp[prev_s] + potential
+                if total > new_dp[next_s]:
+                    new_dp[next_s]   = total
+                    new_back[next_s] = prev_s
+
+        back[0][i + 1] = new_back[0]
+        back[1][i + 1] = new_back[1]
+        prev_dp = new_dp
+
+    # Backtrack to recover optimal state sequence
+    final_s  = 0 if prev_dp[0] >= prev_dp[1] else 1
+    states   = [0] * n
+    states[n - 1] = final_s
+    for i in range(n - 2, -1, -1):
+        states[i] = back[states[i + 1]][i + 1]
+
+    # Apply permutations
+    aligned   = []
+    n_flipped = 0
+    for i, chunk in enumerate(chunks):
+        if states[i] == 1:
+            aligned.append(chunk[list(range(S - 1, -1, -1))])
+            n_flipped += 1
+        else:
+            aligned.append(chunk)
+
+    confs    = [abs(s - f) for s, f in pair_scores]
+    avg_conf = sum(confs) / len(confs) if confs else 0.0
+    print(f"  [Align] {n_flipped}/{n} chunks reordered  "
+          f"avg_boundary_confidence={avg_conf:.3f}"
+          + ("  (low — try --overlap 5)" if avg_conf < 0.05 else ""))
 
     return aligned
 
@@ -389,7 +440,8 @@ def run_chunked(model, audio_input, chunk_samples, overlap_samples, sr: int):
     _, _, T = audio_input.shape
     total_chunks = math.ceil(T / chunk_samples)
     total_audio_s = T / sr
-    output_chunks = []
+    output_chunks  = []
+    overlap_regions = []   # left context [S, T_ovl] per chunk; empty for chunk 0
 
     t_run_start = time.monotonic()
     start = 0
@@ -412,12 +464,14 @@ def run_chunked(model, audio_input, chunk_samples, overlap_samples, sr: int):
             ests = ests.unsqueeze(0)
         ests = ests[0].cpu()  # [S, ctx_len]
 
-        # Strip the context padding — keep only [start, end)
+        # Split into left context and content
         trim_start = start - ctx_start
         trim_end   = trim_start + (end - start)
-        ests       = ests[:, trim_start:trim_end]
+        left_ctx   = ests[:, :trim_start]          # [S, overlap] — same audio as tail of prev chunk
+        ests       = ests[:, trim_start:trim_end]  # [S, content]
 
         output_chunks.append(ests)
+        overlap_regions.append(left_ctx)
         chunk_idx += 1
 
         # Progress + ETA
@@ -437,11 +491,12 @@ def run_chunked(model, audio_input, chunk_samples, overlap_samples, sr: int):
 
         start = end
 
-    # Global speaker-ordering alignment across all chunks.
-    # Each chunk is compared against the running-mean spectral embedding of all
-    # previously aligned chunks, so errors cannot cascade.
-    print("[Align] running global speaker alignment across chunks...")
-    output_chunks = _global_align(output_chunks, win=960, stride=240)
+    # Global speaker-ordering alignment via Viterbi DP over overlap-region votes.
+    # overlap_regions[i] is the same audio as the tail of output_chunks[i-1],
+    # processed by chunk i — gives a direct "same vs flip" signal at each boundary.
+    # DP finds the globally optimal binary assignment so no single boundary error cascades.
+    print("[Align] running Viterbi alignment across chunk boundaries...")
+    output_chunks = _global_align(output_chunks, overlap_regions, win=960, stride=240)
 
     return torch.cat(output_chunks, dim=1)  # [S, T]
 
