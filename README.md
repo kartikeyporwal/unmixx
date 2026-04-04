@@ -88,3 +88,18 @@ Outputs will be saved to `separated_audio/`.
 #### Implementation references:
 - TIGER: https://github.com/JusperLee/TIGER
 - MedleyVox: https://github.com/jeonchangbin49/MedleyVox/tree/main
+
+---
+
+```
+yt-dlp_linux -f bestaudio -x --audio-format mp3 --audio-quality 0 https://youtube.com/shorts/
+ALXV4C7R3PY
+
+./yt-dlp_linux -f bestaudio -x --audio-format wav --postprocessor-args "-ac 1 -ar 16000" https://www.youtube.com/watch?v=5Kn32cIWPSY --output 5Kn32cIWPSY.wav
+
+ffmpeg -i input/oZ8WuIiNibg.wav -c:a pcm_s16le -ac 1 -ar 16000 input/oZ8WuIiNibg_mono.wav
+
+```
+
+yt-dlp_linux -f bestaudio -x --audio-format mp3 --audio-quality 0 https://www.youtube.com/watch?v=jo6iAkSoraY --output input/jo6iAkSoraY.wav
+
